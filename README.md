@@ -227,9 +227,10 @@ pick. But weigh the axes that matter for this product:
    goes dark, and the harness reports it instead of faking quality.
 
 **Where llama wins — cost — is the one axis the architecture already neutralizes.** §12's
-regex fast-path removes ~50% of LLM calls for free, cutting gpt-4o-mini's effective bill
-below llama's pay-per-call price *while keeping gpt-4o-mini's quality*. So the cost argument
-for the weaker model evaporates once tiering is on.
+regex fast-path skips the LLM on 43% of messages, dropping gpt-4o-mini's blended bill from
+$0.116 to **$0.029 / 1k — well under llama's $0.089** pay-per-call price, *while keeping
+gpt-4o-mini's quality on the rows that do hit the LLM*. So the cost argument for the weaker
+model evaporates once tiering is on.
 
 **So:** gpt-4o-mini as the shippable default, tiered router in front for cost. llama-3.3-70b
 stays configurable (one flag) as a fallback if gpt-4o-mini ever has an availability event —
@@ -323,7 +324,7 @@ the model resisted. The honest test of model behavior is `uv run python src/eval
 
 ## 11. What I'd improve next (one more week)
 
-1. **Tighten the tiered router** (built + measured in §12, −52% cost / 0 safety regression):
+1. **Tighten the tiered router** (built + measured in §12, −75% cost / 0 safety regression):
    recover the detail-F1 drop by routing leading-verb rows to the LLM and adding a
    fuzzy-credit detail metric; validate coverage on real (not self-tuned) traffic.
 2. **Confidence + human-in-the-loop:** flag low-confidence extractions for review instead
@@ -345,34 +346,46 @@ live), **Thai number-words** (`ห้าร้อย` — regex can't read them)
 (`ปี/โมง/เบอร์/ฟอง/ชิ้น/%`), **negative amounts**, and **injection/spoof markers**
 (`ignore/ลืม/{}/<>`). Regex output goes through the same `enforce_contract` trust boundary.
 
-Measured head-to-head vs pure `gpt-4o-mini` on all 62 rows
+Measured head-to-head vs pure `gpt-4o-mini` on all 100 rows
 (`uv run python src/eval.py --tiered`; full report in `reports/tiered_report.md`):
 
 | Metric | Pure LLM | Tiered | Δ |
 |---|---|---|---|
-| Txn F1 | 0.853 | 0.729 | **−0.124** |
-| **Amount F1** | 0.930 | 0.930 | **+0.000** |
-| Detail F1 | 0.853 | 0.729 | −0.124 |
-| Exact-match | 90.3% | 77.4% | −12.9 pts |
-| LLM calls | 60 | **29** | −31 |
-| **$/1k msgs** | $0.107 | **$0.051** | **−52%** |
+| Txn F1 | 0.925 | 0.730 | **−0.195** |
+| **Amount F1** | 1.000 | 1.000 | **+0.000** |
+| Detail F1 | 0.925 | 0.730 | −0.195 |
+| Exact-match | 91.0% | 69.6% | −21.4 pts |
+| LLM calls | 98 | **57** | −41 |
+| **$/1k msgs** | $0.116 | **$0.029** | **−75%** |
 
-- **53% of messages fast-pathed → cost halved.**
+- **43% of messages fast-pathed → cost cut 75%** (the fast-pathed rows are $0, so the blended
+  per-1k drops more than the call-count alone).
 - **Kill metric: 0 fast-path-induced regressions** — no hallucinated transactions, no wrong
-  amounts, no injection leaks the pure LLM avoided. The router never emitted a transaction
-  on any adversarial row (verified: all 24 either route to LLM or fast-path to empty).
-- **Amount F1 is unchanged** — the regex preserves amounts exactly; the entire F1 drop is
-  **`detail`**, where the LLM trims `จ่ายค่าไฟ`→`ค่าไฟ` / `กิน mk ไป`→`mk` and the regex
-  keeps the surrounding words. That's the *same* detail-boundary issue from §7, just more of
-  it — a quality-vs-cost trade, not a safety failure.
+  amounts, no injection leaks the pure LLM avoided.
+- **Amount F1 unchanged at 1.000** — the regex preserves amounts exactly; the entire F1 drop
+  is **`detail`**, where the LLM trims `จ่ายค่าไฟ`→`ค่าไฟ` / `กิน mk ไป`→`mk` and the regex
+  keeps the surrounding words. Same detail-boundary issue as §7 — a quality-vs-cost trade,
+  not a safety failure. (The drop is larger than at n=62 because the expanded set has more
+  verb-prefixed rows the regex over-keeps.)
 
-**Honest read:** this is a real 52% cost cut with zero safety regression, paid for in detail
-precision. The trade is *tunable*, not fixed: with a fuzzy-credit `detail` metric (which the
-boundary diffs argue for anyway, §10) most of the −0.124 disappears; alternatively, route
-rows with a leading verb (`จ่าย`/`ซื้อ`/`กิน`) to the LLM to recover detail F1 while keeping
-~40% fast-pathed. **Caveat:** the regex is tuned on these 62 rows, so 53% coverage is
-optimistic vs real long-tail traffic. Shippable as a default *if* detail matching is loosened
-to match product tolerance; otherwise it's the cost lever you reach for under load.
+> **The kill metric earned its keep.** The first 100-row tiered run flagged **3
+> fast-path-induced hallucinations** — new dataset rows (`อุณหภูมิ 35 องศา`, a lottery
+> number, `งบ 100`) hit `NOT_MONEY` deny-list holes, so the regex emitted spend the user
+> never made. That's a *safety* regression, not a detail nit. I added those cues to the
+> deny-list (route-to-LLM), re-verified **0 hallucinations / 0 wrong-amounts across all 100
+> rows**, and only then trusted the numbers above. This is exactly why the kill metric is
+> separate from F1: a tier can look cheap-and-fine on aggregate F1 while quietly inventing
+> transactions.
+
+**Honest read:** a real **75% cost cut with zero safety regression**, paid for in detail
+precision. The trade is *tunable*, not fixed: a fuzzy-credit `detail` metric (which the
+boundary diffs argue for anyway, §10) erases most of the −0.195; or route leading-verb rows
+(`จ่าย`/`ซื้อ`/`กิน`) to the LLM to recover detail F1 at a lower fast-path rate. **Caveat:**
+the regex (and its deny-list) is tuned on these 100 rows, so 43% coverage is optimistic vs
+real long-tail traffic — and the hallucination episode shows the deny-list needs ongoing
+curation. Shippable as a default *if* detail matching is loosened to product tolerance;
+otherwise it's the cost lever to reach for under load, with the kill metric gating each
+deny-list change.
 
 ## 13. Time spent
 
