@@ -20,10 +20,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.ner import extract, enforce_contract, MAX_INPUT_CHARS  # noqa: E402
 
-# Cues that a nearby number is NOT money (age, time, phone, quantity, units, percent).
-# Presence of any of these → don't trust the regex, route to LLM.
+# Cues that a nearby number is NOT money (age, time, phone, quantity, units, percent,
+# temperature, lottery number, budget, address, installment count). Presence of any of
+# these → don't trust the regex, route to LLM. This deny-list is the router's safety
+# margin: when in doubt, the LLM (which is injection-hardened and reads context) decides.
 NOT_MONEY = re.compile(
-    r"(ปี|อายุ|โมง|นาฬิกา|เบอร์|โทร|ฟอง|ชิ้น|อัน|คน|ตัว|ครั้ง|ซม|กม|กิโล|%|เปอร์เซ็นต์|ขวบ)"
+    r"(ปี|อายุ|โมง|นาฬิกา|เบอร์|โทร|ฟอง|ชิ้น|อัน|คน|ตัว|ครั้ง|ซม|กม|กิโล|%|เปอร์เซ็นต์|ขวบ"
+    r"|องศา|อุณหภูมิ|หวย|ล็อตเตอรี่|เลขเด็ด|เลขที่|งบ|งวด|องค์)"
 )
 # Injection / structured-text / spoof markers → route to LLM (it's hardened; regex isn't).
 RISK = re.compile(r"(ignore|instruction|system|prompt|forget|ลืม|คำสั่ง|[{}\[\]<>])", re.I)
