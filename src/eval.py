@@ -21,9 +21,6 @@ DEFAULT_MODELS = os.environ.get(
     "NER_MODELS", "google/gemini-2.5-flash-lite,openai/gpt-4o-mini"
 ).split(",")
 
-# Availability failures: infra/quota, not model-quality misses. Reported separately
-# and EXCLUDED from F1. TRANSIENT is the retryable subset (402 = out of credits is an
-# availability failure but retrying won't help, so it's not retried).
 AVAILABILITY = re.compile(r"^(timeout|http_5\d\d|http_429|http_402|request_error)")
 TRANSIENT = re.compile(r"^(timeout|http_5\d\d|http_429|request_error)")
 
@@ -133,9 +130,13 @@ def pct(xs: list[float], q: float) -> float:
 # --------------------------------------------------------------------------- #
 # Run one model over the dataset.
 # --------------------------------------------------------------------------- #
-def run_model(model: str, rows: list[dict], retries: int = 2, extract_fn=extract) -> dict:
+def run_model(model: str, rows: list[dict], retries: int = 4, extract_fn=extract,
+              delay: float = 0.0) -> dict:
     """extract_fn defaults to the pure-LLM extract(); pass extract_tiered for the
-    regex-fast-path-then-LLM hybrid (cost-optimization bonus). Same scoring either way."""
+    regex-fast-path-then-LLM hybrid (cost-optimization bonus). Same scoring either way.
+
+    delay = seconds to sleep between calls (throttle to avoid provider rate-limits on
+    free/low-tier models). retries uses exponential backoff on transient errors."""
     per_bucket = collections.defaultdict(
         lambda: {"txn": [0, 0, 0], "amt": [0, 0, 0], "det": [0, 0, 0],
                  "exact": 0, "count_ok": 0, "n": 0}
@@ -153,14 +154,16 @@ def run_model(model: str, rows: list[dict], retries: int = 2, extract_fn=extract
     examples: dict[str, list] = collections.defaultdict(list)
     injection_leaks = []
 
-    for row in rows:
+    for i, row in enumerate(rows):
         text, gold, bucket = row["text"], row["transactions"], row["bucket"]
+        if delay and i:
+            time.sleep(delay)
 
-        # call with retry on transient errors
+        # call with exponential backoff on transient errors (timeout/429/5xx)
         result, meta = extract_fn(text, model=model)
         attempt = 0
         while meta.get("error") and TRANSIENT.match(meta["error"]) and attempt < retries:
-            time.sleep(1.5 * (attempt + 1))
+            time.sleep(min(2.0 * (2 ** attempt), 16.0))  # 2,4,8,16s
             result, meta = extract_fn(text, model=model)
             attempt += 1
         pred = result["transactions"]  # extract() guarantees this list exists
