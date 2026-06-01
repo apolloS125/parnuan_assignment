@@ -38,10 +38,17 @@ cp .env.example .env        # then edit OPENROUTER_API_KEY
 Run the eval:
 
 ```bash
-uv run python src/eval.py               # full eval over the dataset, writes reports/
 uv run python src/eval.py --selftest    # offline graceful-degradation checks, NO key needed
+uv run python src/eval.py --limit 2     # SMOKE TEST: 2 rows × 2 models, confirm 200s + cost
+uv run python src/eval.py               # full eval over the dataset, writes reports/
 uv run python src/eval.py --models openai/gpt-4o-mini,anthropic/claude-3.5-sonnet
 ```
+
+> **Run the `--limit 2` smoke test first.** It confirms your key works and that
+> `usage.cost` comes back populated *before* the full 62×2 run. If every row comes back
+> empty with `http_400` / high availability-failures, the request shape was rejected
+> (e.g. the `usage:{include:true}` accounting flag) — check `meta.error` before trusting
+> an F1≈0 table.
 
 ```
 intern/
@@ -87,7 +94,7 @@ scripts (`ner.py`, `eval.py`) + a dataset is the right size for this problem.
 | Bucket | n | What it covers |
 |---|---|---|
 | `happy` | 22 | clean single + multi-transaction; Thai & English merchants; decimals (`89.50`), thousands (`1,250`), `บาท`/`฿`; `แล้วก็`/`กับ` separators |
-| `messy` | 17 | typos, stretched chars (`ค่าาาาข้าว`), slang, mixed Thai/Eng (`coffee 60 grab 80`), amount-before-detail (`50 ข้าวมันไก่`), no spaces (`ชาบู199บาท`), emoji, Thai-word amounts (`ห้าร้อย`) |
+| `messy` | 16 | typos, stretched chars (`ค่าาาาข้าว`), slang, mixed Thai/Eng (`coffee 60 grab 80`), amount-before-detail (`50 ข้าวมันไก่`), no spaces (`ชาบู199บาท`), emoji, Thai-word amounts (`ห้าร้อย`) |
 | `adversarial` | 24 | greetings/questions → empty; only-amount (`500`); only-detail (`ข้าวมันไก่`); empty & whitespace; non-money numbers (age, phone, time, quantity); prompt injection (TH + EN); JSON-in-the-text spoofing; zero-width unicode; huge repeated input; negative amount |
 
 **How I built it:** written by hand from how Thais actually message about money, then each
@@ -212,21 +219,36 @@ re-ranked by the live report):
 
 ## 8. Graceful degradation
 
-Verified by `uv run python src/eval.py --selftest` (**18/18**, no key needed):
+**Contract & parser layer — verified offline by `--selftest` (18/18, no key).** This is
+the part that makes "never break" true, and it's deterministic, so it's fully tested:
 
 | Input | Behavior |
 |---|---|
 | empty / whitespace / non-string | pre-guard → `{"transactions": []}`, no API call |
 | huge input (50k chars) | truncated to 8000 chars, `truncated` flagged, never blows up |
-| zero-width / weird unicode | normalized, handled |
-| prompt injection (TH/EN) | system prompt + delimiters resist; leak-checked → empty |
 | model returns prose / code fences / refusal | defensive parse recovers or → empty |
 | model returns `null` / negative / string amount | coerced or dropped; never rounded, never invented |
-| timeout / 429 / 402 / 5xx | returns empty + flagged as availability failure (retried first) |
+| model returns non-object / extra fields | rebuilt field-by-field; extras stripped |
 | any unexpected exception | caught → `{"transactions": []}` |
 
 The amount coercion preserves values **exactly**: `"1,250"`→`1250`, `50.0`→`50`,
 `"50.5"`→`50.5`; rejects `NaN`/`inf`/`≤0`/booleans.
+
+**Runtime/infra — handled in code, observed in the live eval (not in `--selftest`):**
+
+| Input / event | Behavior |
+|---|---|
+| timeout / 429 / 5xx | retried with backoff; if still failing → empty + counted as **availability failure**, excluded from F1 |
+| 402 (out of credits) | empty + availability failure (not retried — retry won't help) |
+| zero-width / weird unicode | passed to model as data; normalizer handles comparison |
+
+**Model *behavior* on adversarial input — pending the live eval, by design.** Injection
+resistance, empty-on-greeting, and not-money-number handling depend on the model, so they
+are dataset rows (the `adversarial` bucket) scored by the harness, plus an automated
+**injection-leak check** (any predicted detail echoing `HACKED`/`ignore`/`system prompt`
+is flagged; target = 0 leaks). The `--selftest` rows for injection/greeting currently
+return empty only because no key is set — that proves the *contract* holds, **not** that
+the model resisted. The honest test of model behavior is `uv run python src/eval.py`.
 
 ## 9. Trade-offs
 
