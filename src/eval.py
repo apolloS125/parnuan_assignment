@@ -18,12 +18,9 @@ from src.ner import extract, enforce_contract, parse_model_output  # noqa: E402
 
 DATASET = ROOT / "data" / "dataset.jsonl"
 DEFAULT_MODELS = os.environ.get(
-    "NER_MODELS", "google/gemini-2.5-flash-lite,openai/gpt-4o-mini"
+    "NER_MODELS", "openai/gpt-4o-mini,meta-llama/llama-3.3-70b-instruct"
 ).split(",")
 
-# Availability failures: infra/quota, not model-quality misses. Reported separately
-# and EXCLUDED from F1. TRANSIENT is the retryable subset (402 = out of credits is an
-# availability failure but retrying won't help, so it's not retried).
 AVAILABILITY = re.compile(r"^(timeout|http_5\d\d|http_429|http_402|request_error)")
 TRANSIENT = re.compile(r"^(timeout|http_5\d\d|http_429|request_error)")
 
@@ -57,9 +54,7 @@ def exact_match(pred: list, gold: list) -> bool:
     return sorted(txn_key(t) for t in pred) == sorted(txn_key(t) for t in gold)
 
 
-# --------------------------------------------------------------------------- #
 # Failure taxonomy — classify a single non-exact (text, pred, gold).
-# --------------------------------------------------------------------------- #
 def classify(pred: list, gold: list, meta: dict) -> str:
     if meta.get("error") and not gold and not pred:
         return "ok"  # availability failure on an empty-expected row still lands empty
@@ -85,9 +80,7 @@ def classify(pred: list, gold: list, meta: dict) -> str:
     return "wrong_amount_and_detail"
 
 
-# --------------------------------------------------------------------------- #
 # Live pricing fallback (only used if usage.cost is missing).
-# --------------------------------------------------------------------------- #
 _PRICE_CACHE: dict[str, dict] = {}
 
 
@@ -130,12 +123,14 @@ def pct(xs: list[float], q: float) -> float:
     return xs[lo] + (xs[hi] - xs[lo]) * (k - lo)
 
 
-# --------------------------------------------------------------------------- #
 # Run one model over the dataset.
-# --------------------------------------------------------------------------- #
-def run_model(model: str, rows: list[dict], retries: int = 2, extract_fn=extract) -> dict:
+def run_model(model: str, rows: list[dict], retries: int = 4, extract_fn=extract,
+              delay: float = 0.0) -> dict:
     """extract_fn defaults to the pure-LLM extract(); pass extract_tiered for the
-    regex-fast-path-then-LLM hybrid (cost-optimization bonus). Same scoring either way."""
+    regex-fast-path-then-LLM hybrid (cost-optimization bonus). Same scoring either way.
+
+    delay = seconds to sleep between calls (throttle to avoid provider rate-limits on
+    free/low-tier models). retries uses exponential backoff on transient errors."""
     per_bucket = collections.defaultdict(
         lambda: {"txn": [0, 0, 0], "amt": [0, 0, 0], "det": [0, 0, 0],
                  "exact": 0, "count_ok": 0, "n": 0}
@@ -153,14 +148,16 @@ def run_model(model: str, rows: list[dict], retries: int = 2, extract_fn=extract
     examples: dict[str, list] = collections.defaultdict(list)
     injection_leaks = []
 
-    for row in rows:
+    for i, row in enumerate(rows):
         text, gold, bucket = row["text"], row["transactions"], row["bucket"]
+        if delay and i:
+            time.sleep(delay)
 
-        # call with retry on transient errors
+        # call with exponential backoff on transient errors (timeout/429/5xx)
         result, meta = extract_fn(text, model=model)
         attempt = 0
         while meta.get("error") and TRANSIENT.match(meta["error"]) and attempt < retries:
-            time.sleep(1.5 * (attempt + 1))
+            time.sleep(min(2.0 * (2 ** attempt), 16.0))  # 2,4,8,16s
             result, meta = extract_fn(text, model=model)
             attempt += 1
         pred = result["transactions"]  # extract() guarantees this list exists
@@ -237,11 +234,23 @@ def run_model(model: str, rows: list[dict], retries: int = 2, extract_fn=extract
     }
 
 
-# --------------------------------------------------------------------------- #
 # Reporting
-# --------------------------------------------------------------------------- #
 def _f1(store, field):
     return prf(*store[field])
+
+
+def _metrics(store: dict) -> dict:
+    """The numbers both renderers show for one stats block (overall or per-bucket).
+    Computed once here so the markdown and console views can't drift apart."""
+    n = store["n"] or 1
+    return {
+        "n": store["n"],
+        "txn": _f1(store, "txn")[2],
+        "amt": _f1(store, "amt")[2],
+        "det": _f1(store, "det")[2],
+        "exact": store["exact"] / n,
+        "count": store["count_ok"] / n,
+    }
 
 
 def _disp_width(s: str) -> int:
@@ -289,19 +298,15 @@ def render_console(results: list[dict]) -> str:
                "p50ms", "p95ms", "$/1k", "Avail"]
     rows = []
     for r in results:
-        o = r["overall"]
-        tf, af, df = _f1(o, "txn")[2], _f1(o, "amt")[2], _f1(o, "det")[2]
-        em = o["exact"] / o["n"] if o["n"] else 0
-        ca = o["count_ok"] / o["n"] if o["n"] else 0
+        m = _metrics(r["overall"])
         c1k = f"${r['cost_per_1k']:.3f}" if r["cost_per_1k"] is not None else "n/a"
         rows.append([
-            r["model"], f"{tf:.3f}", f"{af:.3f}", f"{df:.3f}",
-            f"{em:.0%}", f"{ca:.0%}",
+            r["model"], f"{m['txn']:.3f}", f"{m['amt']:.3f}", f"{m['det']:.3f}",
+            f"{m['exact']:.0%}", f"{m['count']:.0%}",
             f"{r['latency_p50']:.0f}", f"{r['latency_p95']:.0f}",
             c1k, str(r["avail_failures"]),
         ])
-    right = set(range(1, len(headers)))
-    out.append(_ascii_table(headers, rows, align_right=right))
+    out.append(_ascii_table(headers, rows, align_right=set(range(1, len(headers)))))
     out.append("")
 
     for r in results:
@@ -318,9 +323,9 @@ def render_console(results: list[dict]) -> str:
             s = r["per_bucket"].get(b)
             if not s:
                 continue
-            tf, af, df = _f1(s, "txn")[2], _f1(s, "amt")[2], _f1(s, "det")[2]
-            br.append([b, str(s["n"]), f"{tf:.3f}", f"{af:.3f}", f"{df:.3f}",
-                       f"{s['exact']/s['n']:.0%}", f"{s['count_ok']/s['n']:.0%}"])
+            m = _metrics(s)
+            br.append([b, str(m["n"]), f"{m['txn']:.3f}", f"{m['amt']:.3f}",
+                       f"{m['det']:.3f}", f"{m['exact']:.0%}", f"{m['count']:.0%}"])
         out.append(_ascii_table(bh, br, align_right=set(range(1, len(bh)))))
 
         if not r["taxonomy"]:
@@ -342,15 +347,11 @@ def render(results: list[dict]) -> str:
     out.append("| Model | Txn F1 | Amount F1 | Detail F1 | Exact-match | Count-acc | p50 (ms) | p95 (ms) | $/1k | Cost cov. | Avail. fails |")
     out.append("|---|---|---|---|---|---|---|---|---|---|---|")
     for r in results:
-        o = r["overall"]
-        _, _, tf = _f1(o, "txn")
-        _, _, af = _f1(o, "amt")
-        _, _, df = _f1(o, "det")
-        em = o["exact"] / o["n"] if o["n"] else 0
-        ca = o["count_ok"] / o["n"] if o["n"] else 0
+        m = _metrics(r["overall"])
         c1k = f"${r['cost_per_1k']:.3f}" if r["cost_per_1k"] is not None else "n/a"
         out.append(
-            f"| {r['model']} | {tf:.3f} | {af:.3f} | {df:.3f} | {em:.1%} | {ca:.1%} | "
+            f"| {r['model']} | {m['txn']:.3f} | {m['amt']:.3f} | {m['det']:.3f} | "
+            f"{m['exact']:.1%} | {m['count']:.1%} | "
             f"{r['latency_p50']:.0f} | {r['latency_p95']:.0f} | {c1k} | "
             f"{r['cost_coverage']} | {r['avail_failures']} |"
         )
@@ -369,11 +370,9 @@ def render(results: list[dict]) -> str:
             s = r["per_bucket"].get(b)
             if not s:
                 continue
-            _, _, tf = _f1(s, "txn")
-            _, _, af = _f1(s, "amt")
-            _, _, df = _f1(s, "det")
-            out.append(f"| {b} | {s['n']} | {tf:.3f} | {af:.3f} | {df:.3f} | "
-                       f"{s['exact']/s['n']:.1%} | {s['count_ok']/s['n']:.1%} |")
+            m = _metrics(s)
+            out.append(f"| {b} | {m['n']} | {m['txn']:.3f} | {m['amt']:.3f} | "
+                       f"{m['det']:.3f} | {m['exact']:.1%} | {m['count']:.1%} |")
         out.append("\n### Failure taxonomy\n")
         if not r["taxonomy"]:
             out.append("No failures. 🎉")
@@ -448,6 +447,8 @@ def main() -> int:
                     help="compare pure LLM vs regex-fast-path+LLM hybrid (cost bonus)")
     ap.add_argument("--tiered-model", default="openai/gpt-4o-mini",
                     help="the LLM the tiered comparison falls back to")
+    ap.add_argument("--delay", type=float, default=0.0,
+                    help="seconds between calls; throttle to avoid rate-limits")
     args = ap.parse_args()
 
     if args.selftest:
@@ -471,7 +472,7 @@ def main() -> int:
     results = []
     for m in models:
         print(f"  -> {m}")
-        results.append(run_model(m, rows))
+        results.append(run_model(m, rows, delay=args.delay))
 
     # markdown report -> file (readable, committable); aligned summary -> terminal
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
@@ -493,18 +494,7 @@ def run_tiered_comparison(rows: list[dict], model: str, out: str) -> int:
     print("  -> tiered (regex + LLM)")
     tiered = run_model(model, rows, extract_fn=extract_tiered)
 
-    def f1(r):
-        return prf(*r["overall"]["txn"])[2]
-
-    def af1(r):
-        return prf(*r["overall"]["amt"])[2]
-
-    def df1(r):
-        return prf(*r["overall"]["det"])[2]
-
-    def em(r):
-        return r["overall"]["exact"] / r["overall"]["n"]
-
+    p, t = _metrics(pure["overall"]), _metrics(tiered["overall"])  # single source of truth
     fp = tiered["fast_paths"]
     n = tiered["n_rows"]
     # regression = a severe failure type the tiered run has that pure doesn't (by count)
@@ -517,10 +507,10 @@ def run_tiered_comparison(rows: list[dict], model: str, out: str) -> int:
         f"Regex fast-path → `{model}` fallback, vs pure `{model}`, on {n} messages.\n",
         "| Metric | Pure LLM | Tiered | Δ |",
         "|---|---|---|---|",
-        f"| Txn F1 | {f1(pure):.3f} | {f1(tiered):.3f} | {f1(tiered)-f1(pure):+.3f} |",
-        f"| Amount F1 | {af1(pure):.3f} | {af1(tiered):.3f} | {af1(tiered)-af1(pure):+.3f} |",
-        f"| Detail F1 | {df1(pure):.3f} | {df1(tiered):.3f} | {df1(tiered)-df1(pure):+.3f} |",
-        f"| Exact-match | {em(pure):.1%} | {em(tiered):.1%} | {(em(tiered)-em(pure))*100:+.1f} pts |",
+        f"| Txn F1 | {p['txn']:.3f} | {t['txn']:.3f} | {t['txn']-p['txn']:+.3f} |",
+        f"| Amount F1 | {p['amt']:.3f} | {t['amt']:.3f} | {t['amt']-p['amt']:+.3f} |",
+        f"| Detail F1 | {p['det']:.3f} | {t['det']:.3f} | {t['det']-p['det']:+.3f} |",
+        f"| Exact-match | {p['exact']:.1%} | {t['exact']:.1%} | {(t['exact']-p['exact'])*100:+.1f} pts |",
         f"| LLM calls | {pure['api_calls']} | {tiered['api_calls']} | {tiered['api_calls']-pure['api_calls']} |",
         f"| $/1k msgs | ${pure['cost_per_1k']:.3f} | ${tiered['cost_per_1k']:.3f} | "
         f"{(tiered['cost_per_1k']-pure['cost_per_1k'])/pure['cost_per_1k']*100:+.0f}% |",

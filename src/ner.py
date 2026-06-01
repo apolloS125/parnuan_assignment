@@ -24,7 +24,7 @@ except Exception:  # dotenv is optional; env vars may be set another way
     pass
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_MODEL = os.environ.get("NER_DEFAULT_MODEL", "google/gemini-2.5-flash-lite")
+DEFAULT_MODEL = os.environ.get("NER_DEFAULT_MODEL", "openai/gpt-4o-mini")
 
 # Guards against runaway cost / huge-input abuse. We truncate rather than reject so the
 # system still "supports any input without breaking".
@@ -144,9 +144,7 @@ def enforce_contract(obj: Any) -> dict[str, list]:
         return {"transactions": []}
 
 
-# --------------------------------------------------------------------------- #
 # Defensive JSON parsing — model output may have prose, code fences, etc.
-# --------------------------------------------------------------------------- #
 def parse_model_output(content: str) -> dict[str, list]:
     """Pull a transactions object out of raw model text. Never raises."""
     if not isinstance(content, str) or not content.strip():
@@ -172,9 +170,7 @@ def parse_model_output(content: str) -> dict[str, list]:
     return {"transactions": []}
 
 
-# --------------------------------------------------------------------------- #
 # Main entry point.
-# --------------------------------------------------------------------------- #
 def extract(
     text: Any,
     model: str = DEFAULT_MODEL,
