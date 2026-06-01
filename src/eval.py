@@ -261,6 +261,97 @@ def _f1(store, field):
     return prf(*store[field])
 
 
+def _disp_width(s: str) -> int:
+    """Display width: Thai combining marks / zero-width add 0, everything else 1.
+    Keeps ASCII tables aligned even when a cell holds Thai text."""
+    import unicodedata
+
+    w = 0
+    for ch in s:
+        if unicodedata.combining(ch) or ch in "​‌‍":
+            continue
+        w += 1
+    return w
+
+
+def _ascii_table(headers: list[str], rows: list[list[str]], align_right=None) -> str:
+    """Render a left/right-aligned ASCII table that lines up in a terminal."""
+    align_right = align_right or set()
+    cols = list(zip(*([headers] + rows))) if rows else [[h] for h in headers]
+    widths = [max(_disp_width(str(c)) for c in col) for col in cols]
+
+    def fmt(cells):
+        parts = []
+        for i, c in enumerate(cells):
+            c = str(c)
+            pad = widths[i] - _disp_width(c)
+            parts.append((" " * pad + c) if i in align_right else (c + " " * pad))
+        return "  " + "   ".join(parts)
+
+    sep = "  " + "   ".join("-" * w for w in widths)
+    return "\n".join([fmt(headers), sep] + [fmt(r) for r in rows])
+
+
+def render_console(results: list[dict]) -> str:
+    """Human-readable, terminal-aligned summary (not markdown). Used for stdout."""
+    color = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+    BOLD, DIM, GRN, YEL, RST = (
+        ("\033[1m", "\033[2m", "\033[32m", "\033[33m", "\033[0m") if color
+        else ("", "", "", "", "")
+    )
+    out = [f"\n{BOLD}══ NER EVAL ═════════════════════════════════════════{RST}\n"]
+
+    out.append(f"{BOLD}Model comparison{RST}")
+    headers = ["Model", "TxnF1", "AmtF1", "DetF1", "Exact", "Count",
+               "p50ms", "p95ms", "$/1k", "Avail"]
+    rows = []
+    for r in results:
+        o = r["overall"]
+        tf, af, df = _f1(o, "txn")[2], _f1(o, "amt")[2], _f1(o, "det")[2]
+        em = o["exact"] / o["n"] if o["n"] else 0
+        ca = o["count_ok"] / o["n"] if o["n"] else 0
+        c1k = f"${r['cost_per_1k']:.3f}" if r["cost_per_1k"] is not None else "n/a"
+        rows.append([
+            r["model"], f"{tf:.3f}", f"{af:.3f}", f"{df:.3f}",
+            f"{em:.0%}", f"{ca:.0%}",
+            f"{r['latency_p50']:.0f}", f"{r['latency_p95']:.0f}",
+            c1k, str(r["avail_failures"]),
+        ])
+    right = set(range(1, len(headers)))
+    out.append(_ascii_table(headers, rows, align_right=right))
+    out.append("")
+
+    for r in results:
+        leaks = r["injection_leaks"]
+        leak_str = f"{GRN}none ✓{RST}" if not leaks else f"{YEL}{len(leaks)} ⚠{RST}"
+        out.append(f"{BOLD}▸ {r['model']}{RST}   "
+                   f"{DIM}{r['api_calls']} API calls · "
+                   f"{r['short_circuits']} short-circuit · "
+                   f"{r['avail_failures']} avail-fail · injection-leaks: {RST}{leak_str}")
+
+        bh = ["bucket", "n", "TxnF1", "AmtF1", "DetF1", "Exact", "Count"]
+        br = []
+        for b in ("happy", "messy", "adversarial"):
+            s = r["per_bucket"].get(b)
+            if not s:
+                continue
+            tf, af, df = _f1(s, "txn")[2], _f1(s, "amt")[2], _f1(s, "det")[2]
+            br.append([b, str(s["n"]), f"{tf:.3f}", f"{af:.3f}", f"{df:.3f}",
+                       f"{s['exact']/s['n']:.0%}", f"{s['count_ok']/s['n']:.0%}"])
+        out.append(_ascii_table(bh, br, align_right=set(range(1, len(bh)))))
+
+        if not r["taxonomy"]:
+            out.append(f"  {GRN}no failures 🎉{RST}")
+        else:
+            out.append(f"  {DIM}failures:{RST}")
+            for cat, n in sorted(r["taxonomy"].items(), key=lambda x: -x[1]):
+                ex = r["examples"].get(cat, [])
+                eg = f"  e.g. {ex[0]['text'][:40]!r}" if ex else ""
+                out.append(f"    {YEL}{n:>2}{RST} {cat}{DIM}{eg}{RST}")
+        out.append("")
+    return "\n".join(out)
+
+
 def render(results: list[dict]) -> str:
     out = ["# NER Eval Report\n"]
     # headline comparison table
@@ -403,11 +494,11 @@ def main() -> int:
         print(f"  -> {m}")
         results.append(run_model(m, rows))
 
-    report = render(results)
+    # markdown report -> file (readable, committable); aligned summary -> terminal
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.out).write_text(report, encoding="utf-8")
-    print("\n" + report)
-    print(f"\nReport written to {args.out}")
+    Path(args.out).write_text(render(results), encoding="utf-8")
+    print(render_console(results))
+    print(f"Full markdown report → {args.out}")
     return 0
 
 
