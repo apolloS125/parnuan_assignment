@@ -1,5 +1,4 @@
 """Eval harness for the Thai transaction NER system.
-
 One command:
 
     uv run python src/eval.py                      # full eval (needs OPENROUTER_API_KEY)
@@ -7,24 +6,6 @@ One command:
     uv run python src/eval.py --limit 10           # quick subset
     uv run python src/eval.py --selftest           # offline graceful-degradation checks, no key
 
-Reports, per model:
-  - transaction-level P/R/F1 (the headline: amount AND detail must match)
-  - amount-only and detail-only F1 (diagnostics, via multiset intersection)
-  - full-array exact-match rate, transaction-count accuracy
-  - latency p50/p95 (over API-hitting calls only)
-  - $/1k messages (from real usage.cost; falls back to token x live price)
-  - failure taxonomy (counts + examples)
-  - per-bucket breakdown (happy / messy / adversarial)
-  - availability failures (timeouts/429/402) reported SEPARATELY from quality
-  - injection-leak check on adversarial rows
-
-Design notes that matter for honesty:
-  * F1 uses MULTISET matching, not alignment-by-the-scored-field, so amount-F1 isn't
-    circular (a pred matched to a gold by amount would trivially have a correct amount).
-  * System errors (meta.error set) -> the row gets a placeholder empty result AND is
-    counted as an availability failure, NOT scored as a model "miss". After retries.
-  * Latency/cost percentiles exclude pre-guard short-circuits (empty/huge), which cost
-    nothing and would deflate the numbers.
 """
 
 from __future__ import annotations
@@ -47,7 +28,7 @@ from src.ner import extract, enforce_contract, parse_model_output  # noqa: E402
 
 DATASET = ROOT / "data" / "dataset.jsonl"
 DEFAULT_MODELS = os.environ.get(
-    "NER_MODELS", "google/gemini-2.0-flash-001,openai/gpt-4o-mini"
+    "NER_MODELS", "google/gemini-2.5-flash-lite,openai/gpt-4o-mini"
 ).split(",")
 
 # Availability failures: infra/quota, not model-quality misses. Reported separately
