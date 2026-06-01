@@ -40,7 +40,10 @@ MAX_DETAIL_CHARS = 200
 # Anything beyond this is almost certainly hallucinated repetition.
 MAX_TRANSACTIONS = 100
 
-EMPTY: dict[str, list] = {"transactions": []}
+def _empty() -> dict[str, list]:
+    """Fresh empty result. Don't share one module-level dict — its inner list could
+    be mutated by a caller and leak across calls."""
+    return {"transactions": []}
 
 SYSTEM_PROMPT = """\
 You are a precise information-extraction function for a Thai personal-finance app.
@@ -219,10 +222,10 @@ def extract(
     # --- pre-guard: no LLM call needed for trivial / non-string input ---
     if not isinstance(text, str):
         meta["error"] = "non_string_input"
-        return EMPTY.copy(), meta
+        return _empty(), meta
     if not text.strip():
         meta["error"] = "empty_input"
-        return EMPTY.copy(), meta
+        return _empty(), meta
     if len(text) > MAX_INPUT_CHARS:
         text = text[:MAX_INPUT_CHARS]
         meta["truncated"] = True
@@ -230,7 +233,7 @@ def extract(
     key = api_key or os.environ.get("OPENROUTER_API_KEY")
     if not key:
         meta["error"] = "no_api_key"
-        return EMPTY.copy(), meta
+        return _empty(), meta
 
     payload = {
         "model": model,
@@ -256,23 +259,23 @@ def extract(
     except requests.exceptions.Timeout:
         meta["latency_ms"] = (time.perf_counter() - start) * 1000
         meta["error"] = "timeout"
-        return EMPTY.copy(), meta
+        return _empty(), meta
     except requests.exceptions.RequestException as exc:
         meta["latency_ms"] = (time.perf_counter() - start) * 1000
         meta["error"] = f"request_error:{type(exc).__name__}"
-        return EMPTY.copy(), meta
+        return _empty(), meta
     meta["latency_ms"] = (time.perf_counter() - start) * 1000
 
     if resp.status_code != 200:
         # 429 rate limit, 402 credits, 5xx provider down — all degrade to empty.
         meta["error"] = f"http_{resp.status_code}"
-        return EMPTY.copy(), meta
+        return _empty(), meta
 
     try:
         data = resp.json()
     except Exception:
         meta["error"] = "bad_json_envelope"
-        return EMPTY.copy(), meta
+        return _empty(), meta
 
     usage = data.get("usage") or {}
     meta["cost_usd"] = usage.get("cost")
@@ -283,7 +286,7 @@ def extract(
         content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):
         meta["error"] = "no_content"
-        return EMPTY.copy(), meta
+        return _empty(), meta
 
     return parse_model_output(content), meta
 

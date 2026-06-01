@@ -50,7 +50,10 @@ DEFAULT_MODELS = os.environ.get(
     "NER_MODELS", "google/gemini-2.0-flash-001,openai/gpt-4o-mini"
 ).split(",")
 
-# transient errors worth retrying before declaring an availability failure
+# Availability failures: infra/quota, not model-quality misses. Reported separately
+# and EXCLUDED from F1. TRANSIENT is the retryable subset (402 = out of credits is an
+# availability failure but retrying won't help, so it's not retried).
+AVAILABILITY = re.compile(r"^(timeout|http_5\d\d|http_429|http_402|request_error)")
 TRANSIENT = re.compile(r"^(timeout|http_5\d\d|http_429|request_error)")
 
 
@@ -197,11 +200,16 @@ def run_model(model: str, rows: list[dict], retries: int = 2) -> dict:
 
         err = meta.get("error")
         if err in ("empty_input", "non_string_input"):
+            # pre-guard short-circuit: no API call, ~0 cost/latency. Still scored
+            # (these rows expect [], and returning [] is correct).
             short_circuits += 1
-        elif err and TRANSIENT.match(err):
-            avail_failures += 1   # counted separately, NOT as quality miss
-            # still scored below (it returns []), but flagged in the report
+        elif err and AVAILABILITY.match(err):
+            # infra/quota failure (timeout, 429, 402, 5xx). Already retried above.
+            # Count as an availability failure and SKIP scoring — transient infra
+            # noise must not corrupt the model's quality F1.
+            avail_failures += 1
             api_calls += 1
+            continue
         else:
             api_calls += 1
             latencies.append(meta["latency_ms"])
