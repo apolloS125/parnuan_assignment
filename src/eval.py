@@ -1,13 +1,3 @@
-"""Eval harness for the Thai transaction NER system.
-One command:
-
-    uv run python src/eval.py                      # full eval (needs OPENROUTER_API_KEY)
-    uv run python src/eval.py --models a,b         # override models
-    uv run python src/eval.py --limit 10           # quick subset
-    uv run python src/eval.py --selftest           # offline graceful-degradation checks, no key
-
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -37,14 +27,7 @@ DEFAULT_MODELS = os.environ.get(
 AVAILABILITY = re.compile(r"^(timeout|http_5\d\d|http_429|http_402|request_error)")
 TRANSIENT = re.compile(r"^(timeout|http_5\d\d|http_429|request_error)")
 
-
-# --------------------------------------------------------------------------- #
-# Normalization + matching
-# --------------------------------------------------------------------------- #
 def norm_detail(s: str) -> str:
-    """Normalize a detail string for comparison: lower, collapse whitespace,
-    drop zero-width chars. Deliberately lenient — we don't want to punish a model
-    for a trailing space or casing on an English merchant name."""
     s = s.replace("​", "").replace("‌", "").replace("‍", "")
     s = re.sub(r"\s+", "", s.strip().lower())
     return s
@@ -401,10 +384,8 @@ def render(results: list[dict]) -> str:
         out.append("")
     return "\n".join(out)
 
-
-# --------------------------------------------------------------------------- #
 # Offline self-test — proves graceful degradation without any API key.
-# --------------------------------------------------------------------------- #
+
 def selftest() -> int:
     print("Running offline graceful-degradation checks (no API key needed)...\n")
     cases = [
@@ -455,8 +436,6 @@ def selftest() -> int:
     print(f"\n{passed}/{total} checks passed.")
     return 0 if passed == total else 1
 
-
-# --------------------------------------------------------------------------- #
 def main() -> int:
     ap = argparse.ArgumentParser(description="Run NER eval.")
     ap.add_argument("--models", default=",".join(DEFAULT_MODELS),
