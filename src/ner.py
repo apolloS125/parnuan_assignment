@@ -144,9 +144,7 @@ def enforce_contract(obj: Any) -> dict[str, list]:
         return {"transactions": []}
 
 
-# --------------------------------------------------------------------------- #
 # Defensive JSON parsing — model output may have prose, code fences, etc.
-# --------------------------------------------------------------------------- #
 def parse_model_output(content: str) -> dict[str, list]:
     """Pull a transactions object out of raw model text. Never raises."""
     if not isinstance(content, str) or not content.strip():
@@ -172,9 +170,7 @@ def parse_model_output(content: str) -> dict[str, list]:
     return {"transactions": []}
 
 
-# --------------------------------------------------------------------------- #
 # Main entry point.
-# --------------------------------------------------------------------------- #
 def extract(
     text: Any,
     model: str = DEFAULT_MODEL,
