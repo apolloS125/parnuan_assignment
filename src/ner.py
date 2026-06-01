@@ -24,7 +24,7 @@ except Exception:  # dotenv is optional; env vars may be set another way
     pass
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_MODEL = os.environ.get("NER_DEFAULT_MODEL", "google/gemini-2.5-flash-lite")
+DEFAULT_MODEL = os.environ.get("NER_DEFAULT_MODEL", "openai/gpt-4o-mini")
 
 # Guards against runaway cost / huge-input abuse. We truncate rather than reject so the
 # system still "supports any input without breaking".

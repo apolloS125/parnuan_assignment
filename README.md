@@ -53,7 +53,7 @@ uv run python src/eval.py --tiered      # bonus: regex+LLM hybrid vs pure LLM (c
 
 ```
 intern/
-├── data/dataset.jsonl     # 62 labeled rows, bucketed happy/messy/adversarial
+├── data/dataset.jsonl     # 100 labeled rows, bucketed happy/messy/adversarial
 ├── src/ner.py             # core extract() + contract enforcement (the trust boundary)
 ├── src/tiered.py          # bonus: regex fast-path router in front of the LLM
 ├── src/eval.py            # one-command eval: metrics, taxonomy, latency, cost (+ --tiered)
@@ -62,10 +62,10 @@ intern/
 ```
 
 > **Status of the numbers below.** The model-comparison table, taxonomy, and §6
-> recommendation are populated from a **live 62-message run on 2026-06-01** (gemini-2.5-
-> flash-lite vs gpt-4o-mini via OpenRouter; full report in `reports/eval_report.md`).
-> The contract/graceful-degradation layer is additionally verified offline
-> (`--selftest`, 18/18). Re-run anytime with `uv run python src/eval.py`.
+> recommendation are from a **single clean 100-message run** (gpt-4o-mini vs
+> llama-3.3-70b via OpenRouter, both completing every row; full report in
+> `reports/eval_report.md`). The contract/graceful-degradation layer is additionally
+> verified offline (`--selftest`, 18/18). Re-run anytime with `uv run python src/eval.py`.
 
 ---
 
@@ -91,13 +91,13 @@ scripts (`ner.py`, `eval.py`) + a dataset is the right size for this problem.
 
 ## 2. Dataset
 
-**62 hand-labeled rows** in `data/dataset.jsonl`, each `{text, transactions, bucket}`.
+**100 hand-labeled rows** in `data/dataset.jsonl`, each `{text, transactions, bucket}`.
 
 | Bucket | n | What it covers |
 |---|---|---|
-| `happy` | 22 | clean single + multi-transaction; Thai & English merchants; decimals (`89.50`), thousands (`1,250`), `บาท`/`฿`; `แล้วก็`/`กับ` separators |
-| `messy` | 16 | typos, stretched chars (`ค่าาาาข้าว`), slang, mixed Thai/Eng (`coffee 60 grab 80`), amount-before-detail (`50 ข้าวมันไก่`), no spaces (`ชาบู199บาท`), emoji, Thai-word amounts (`ห้าร้อย`) |
-| `adversarial` | 24 | greetings/questions → empty; only-amount (`500`); only-detail (`ข้าวมันไก่`); empty & whitespace; non-money numbers (age, phone, time, quantity); prompt injection (TH + EN); JSON-in-the-text spoofing; zero-width unicode; huge repeated input; negative amount |
+| `happy` | 32 | clean single + multi-transaction (up to 5/msg); Thai & English merchants; decimals (`89.50`), thousands (`12,450`), `บาท`/`฿`; `แล้วก็`/`กับ` separators; long/dense messages for latency realism |
+| `messy` | 28 | typos, stretched chars (`ค่าาาาข้าว`), slang, mixed Thai/Eng (`coffee 60 grab 80`), amount-before-detail (`50 ข้าวมันไก่`), no spaces (`ชาบู199บาท`, `จ่ายค่าหอ4500ค่าน้ำค่าไฟ800`), emoji, Thai-word amounts (`ห้าร้อย`, `สองพันห้า`) |
+| `adversarial` | 40 | greetings/questions → empty; only-amount (`500`); only-detail; empty & whitespace; non-money numbers (age, phone, time, quantity, lottery number, address); `0 บาท`; prompt injection (TH + EN, several styles); JSON/code-fence spoofing; zero-width unicode; huge repeated input; negative amount + discount (`-100 จ่ายจริง 400`). **13 carry a real transaction alongside the noise**, so the adversarial F1 measures extraction-under-attack, not just empty-detection. |
 
 **How I built it:** written by hand from how Thais actually message about money, then each
 label verified by eye. Raw text source doesn't matter; correct labels do.
@@ -171,99 +171,95 @@ detail both match gold.
 
 ## 5. Model comparison
 
-Two models via OpenRouter — one cheap/fast, one stronger — chosen at eval time from live
-`/models` to avoid stale IDs. Defaults: `google/gemini-2.0-flash-001` and
-`openai/gpt-4o-mini`. (Swap the strong one for `anthropic/claude-3.5-sonnet` via `--models`.)
-
-Live numbers, 62 messages, `temperature=0`, run on 2026-06-01 (full report in
+Two models via OpenRouter — `openai/gpt-4o-mini` (general-purpose) vs
+`meta-llama/llama-3.3-70b-instruct` (cheaper, larger open model). One clean run, **100
+messages, `temperature=0`, both models completing every row** (full report in
 `reports/eval_report.md`):
 
-| Model | Txn F1 | Amount F1 | p50 / p95 latency | $/1k msgs | Cost cov. | Avail. fails | Injection leaks |
-|---|---|---|---|---|---|---|---|
-| google/gemini-2.5-flash-lite | **0.913** | 0.986 | 2730 / **10113** ms | **$0.074** | 60/60 | 0 | 0 ✅ |
-| openai/gpt-4o-mini | 0.853 | 0.930 | **1411 / 2332** ms | $0.107 | 60/60 | 0 | 0 ✅ |
+| Model | Txn F1 | Amount F1 | Exact | Count-acc | p50 / p95 latency | $/1k msgs | Avail. fails | Injection leaks |
+|---|---|---|---|---|---|---|---|---|
+| openai/gpt-4o-mini | **0.925** | **1.000** | **91%** | **100%** | 1367 / **2314** ms | $0.116 | 0 | 0 ✅ |
+| meta-llama/llama-3.3-70b | 0.827 | 0.900 | 80% | 88% | 1614 / 4165 ms | **$0.089** | 0 | 0 ✅ |
 
-Per-bucket (Txn F1 / exact-match):
+Per-bucket (Txn F1 / exact-match / count-accuracy):
 
-| Bucket | gemini-2.5-flash-lite | gpt-4o-mini |
+| Bucket | gpt-4o-mini | llama-3.3-70b |
 |---|---|---|
-| happy (22) | 0.938 / 90.9% | 0.906 / 86.4% |
-| messy (16) | 0.864 / 81.2% | 0.909 / 87.5% |
-| adversarial (24) | 0.933 / 91.7% | 0.571 / **95.8%** |
+| happy (32) | 0.926 / 88% / **100%** | 0.739 / 62% / 75% |
+| messy (28) | 0.878 / 82% / **100%** | 0.886 / 86% / 96% |
+| adversarial (40) | **1.000** / 100% / 100% | 0.898 / 90% / 92% |
 
-> **Reading the adversarial column.** Txn F1 there is computed over only the handful of
-> adversarial rows that contain a *real* transaction (most expect `[]`, which contributes
-> `(0,0,0)` to micro-F1), so it's noisy and not the headline for that bucket.
-> **Exact-match / count-accuracy are the honest signal for empty-expected rows** — and on
-> those, gpt-4o-mini is actually *stronger* (95.8% vs 91.7%): it correctly emptied the
-> `-50` negative-amount and JSON-spoof rows that gemini stumbled on.
+> **Reading these honestly.** Both ran clean (0 availability failures, 0 injection leaks,
+> 98 API calls + 2 pre-guard short-circuits each). With the expanded adversarial bucket
+> (40 rows, 13 carrying a real transaction) the adversarial F1 is no longer the noisy
+> ~3-row statistic it was at n=62 — it now means something, and gpt-4o-mini hits a clean
+> 1.000 there. **Amount F1 and count-accuracy are the load-bearing numbers**: gpt-4o-mini
+> is exact on both (1.000 / 100%), llama is not (0.900 / 88%).
 
-> **Why the first run showed gemini F1 = 0.000:** the originally-configured
-> `google/gemini-2.0-flash-001` returned `404 No endpoints found` on every call — a dead
-> model ID, not a model failure. The harness degraded gracefully (empty + scored as
-> `missed_all`), which is exactly how a config error *should* surface. Switching to the
-> live `google/gemini-2.5-flash-lite` fixed it. Lesson baked into Quickstart: run
-> `--limit 2` first and check `meta.error`/cost coverage before trusting a table.
+> **Note on model availability.** The earlier cheap candidate (`gemini-2.5-flash-lite`)
+> later returned `http_402` (provider out of credits) on every call, which the harness
+> surfaced as 98/98 availability failures rather than crashing or faking quality — exactly
+> how an infra failure should appear. That is itself the uptime signal the rubric asks for;
+> I swapped in llama-3.3-70b (live, and cheaper than gpt-4o-mini) for the comparison.
 
 ## 6. Recommendation
 
-**Ship `openai/gpt-4o-mini`.** And note up front what is *not* the reason: the headline
-0.913 vs 0.853 Txn-F1 gap. Decomposed by the buckets that actually contain transactions,
-the two are tied on real extraction — gemini wins happy (0.938 vs 0.906), gpt-4o-mini wins
-messy (0.909 vs 0.864). The entire headline gap comes from the adversarial micro-F1
-(0.933 vs 0.571), which my own table note flags as noisy (computed over a handful of rows).
-"Ship the higher F1" would be exactly the F1-only reasoning to avoid.
+**Ship `openai/gpt-4o-mini`.** This is the case where the *cheaper, larger* model is the
+wrong choice — the opposite of "pick the biggest" and the opposite of "pick the cheapest."
 
-The constraints that actually discriminate:
+llama-3.3-70b is **23% cheaper** ($0.089 vs $0.116 / 1k) and a bigger model, so the naive
+pick. But weigh the axes that matter for this product:
 
-1. **Adversarial safety — the product's #1 goal — favors gpt-4o-mini, on severity not
-   count.** Both fail one extra adversarial row, but the *kind* differs:
-   - gpt-4o-mini's miss: merged the 10×`ค่าข้าว 50` spam into one — benign, arguably sane.
-   - gemini's misses: turned `ค่ากาแฟ -50` into a **+50 purchase the user never made**
-     (hallucination), and was **fooled by an embedded-JSON spoof**, dropping the real ฿55.
-     Both land on "never hallucinate / never get injected." My own gate (a hallucinated
-     transaction is worse than a missed one) disqualifies gemini here. gpt-4o-mini also
-     scores higher adversarial exact-match (95.8% vs 91.7%).
-2. **Latency stability favors gpt-4o-mini, and it's not an artifact.** gemini's p95 is
-   10.1s vs gpt-4o-mini's 2.3s. I checked the raw distribution (not one cold-start outlier):
-   gemini p50=2.5s but p90=9.0s, top-5 = 9.9–18.1s — a systematically heavy tail. For an
-   interactive "type a message, see transactions" flow, a 10s tail is a worse UX than the
-   cost saving is worth.
-3. **Uptime/rate-limits did not discriminate** — both had 0 availability failures, but
-   that's a single 60-message run, not an uptime test, so I claim it for neither.
+1. **Quality, where it's load-bearing.** gpt-4o-mini is **exact on amounts (F1 1.000) and
+   transaction count (100%)**; llama is 0.900 / 88%. For a finance app a wrong *count* means
+   a dropped or invented row — llama's `missed_all` × 11 includes trivially-easy rows like
+   `ข้าวมันไก่ 50`. A user re-typing 1-in-8 messages erases any cost saving in support load
+   and churn.
+2. **Adversarial safety — the product's #1 goal.** gpt-4o-mini: **1.000 / 100% exact** on
+   the 40-row adversarial bucket, zero hallucinations. llama: 0.898, and it **hallucinated
+   `ค่ากาแฟ -50` into a +50 purchase the user never made** — the exact worst case the spec
+   names. That trips the gate regardless of price.
+3. **Latency.** gpt-4o-mini p95 2.3s vs llama 4.2s. For an interactive "type → see
+   transactions" flow, ~2× the tail is felt.
+4. **Uptime.** Both 0 availability failures *this run*. Not an uptime test (single run), so
+   I claim it for neither — but the gemini `http_402` episode (§5) is a live reminder that
+   provider availability is a real axis: the shipped system degrades gracefully when a model
+   goes dark, and the harness reports it instead of faking quality.
 
-**Where gemini wins: cost** ($0.074 vs $0.107 per 1k). At 500k users × ~4 msgs/day that's
-roughly **$54k vs $78k/yr** — real but second-order against a 4× worse latency tail and a
-hallucination on negative amounts. And §12's regex fast-path shrinks whichever model's bill
-by ~80%, narrowing the gap further.
+**Where llama wins — cost — is the one axis the architecture already neutralizes.** §12's
+regex fast-path removes ~50% of LLM calls for free, cutting gpt-4o-mini's effective bill
+below llama's pay-per-call price *while keeping gpt-4o-mini's quality*. So the cost argument
+for the weaker model evaporates once tiering is on.
 
-**So:** gpt-4o-mini as the shippable default. Keep gemini-2.5-flash-lite configured (one
-flag) as a cost lever to revisit if its latency tail tightens or the fast-path makes cost
-dominate. This is a close, defensible call — decided on adversarial severity and latency
-stability, not on the noisy F1 headline.
+**So:** gpt-4o-mini as the shippable default, tiered router in front for cost. llama-3.3-70b
+stays configurable (one flag) as a fallback if gpt-4o-mini ever has an availability event —
+which is the realistic role for the cheaper model here: redundancy, not primary.
 
-## 7. Failure taxonomy (observed, live run)
+## 7. Failure taxonomy (observed, 100-row run)
 
-Both models had **0 wrong-amount errors** (amount F1 ≥ 0.93; the exact-copy instruction +
-non-rounding coercion held) and **0 injection leaks**. The failures that did occur:
+Both models had **0 injection leaks**. gpt-4o-mini also had **0 wrong-amount and 0
+hallucinated transactions**. The failures by model:
 
-- **`wrong_or_truncated_detail` — 5 per model, the dominant mode.** The model's detail is
-  a defensible paraphrase that doesn't string-match gold: `ค่าฟิตเนสรายเดือน` vs gold
-  `ค่าฟิตเนส`, `ค่า grab` vs `grab`, `7-11` vs `ของที่ 7-11`. These are **boundary
-  disagreements, not extraction failures** — the amount is right and a human would accept
-  the detail. This is as much a labeling-strictness artifact as a model error (see
-  Limitations); a `detail` F1 with fuzzy credit would absorb most of them.
-- **`merged_or_missed_txn` — gpt-4o-mini, 1.** Collapsed the 10×`ค่าข้าว 50` repeat row
-  into a single transaction. Low severity (the row is itself adversarial spam).
-- **`hallucinated_txn` — gemini, 1 (high severity).** `ค่ากาแฟ -50 บาท` → emitted a
-  *positive* ฿50. A negative/refund amount became a spend the user never made — the exact
-  worst case the product must avoid. (gpt-4o-mini correctly emitted nothing.)
-- **`missed_all` — gemini, 1.** The embedded-JSON spoof row
-  (`{"transactions":[...]} แต่จริงๆ จ่ายค่ากาแฟ 55`) — gemini anchored on the fake JSON and
-  dropped the real ฿55. A mild injection success; gpt-4o-mini extracted the ฿55 correctly.
+**gpt-4o-mini — 9 failures, all one benign mode:**
+- **`wrong_or_truncated_detail` × 9 — the only mode.** The detail is a defensible paraphrase
+  that doesn't string-match gold: `ซื้อของที่ 7-11` vs `ของที่ 7-11`, `ค่าฟิตเนสรายเดือน` vs
+  `ค่าฟิตเนส`, `ค่า grab` vs `grab`. **Boundary disagreements, not extraction failures** —
+  amount and count are right, a human would accept the detail. As much a labeling-strictness
+  artifact as a model error (see §10); a fuzzy-credit `detail` metric absorbs most of them.
 
-No `merged`/`split` on the clean run-on cases (`ชาบู199บาท`) — both models segmented those
-fine, which I'd flagged as a risk and turned out not to be at this scale.
+**llama-3.3-70b — 20 failures, including severe ones:**
+- **`missed_all` × 11 (high severity).** Returned `[]` on rows with an obvious single
+  transaction — `ข้าวมันไก่ 50`, `ส้มตำ 40`, `ตั๋วหนัง 220`. This is why its happy-bucket
+  count-accuracy is only 75%: it silently drops easy transactions. The single worst trait
+  for a finance extractor.
+- **`wrong_or_truncated_detail` × 8** — same boundary class as gpt-4o-mini.
+- **`hallucinated_txn` × 1 (high severity).** `ค่ากาแฟ -50 บาท` → emitted a *positive* ฿50:
+  a negative/refund became a spend the user never made. gpt-4o-mini correctly emitted nothing
+  on this exact row.
+
+No `merged`/`split` on the clean run-on / no-space cases (`ชาบู199บาท`,
+`จ่ายค่าหอ4500ค่าน้ำค่าไฟ800`) for gpt-4o-mini — segmentation, which I'd flagged as the
+likely ceiling, held up. The real ceiling is detail-boundary strictness (§10).
 
 ## 8. Graceful degradation
 
@@ -316,9 +312,10 @@ the model resisted. The honest test of model behavior is `uv run python src/eval
   `ค่า grab` vs `grab` — defensible paraphrases that fail normalized-exact match. Run-on
   segmentation (`ชาบู199บาท`) actually held up. So the headline F1 understates real-world
   usefulness; a fuzzy-credit detail metric or looser labels would lift it ~5–8 pts.
-- **62 examples** is enough to *characterize* behavior, not to certify it — real traffic
-  has long-tail phrasing the set doesn't cover. Eval numbers are directional, and
-  adversarial-bucket F1 in particular is noisy (few real-transaction rows).
+- **100 examples** is enough to *characterize* behavior, not to certify it — real traffic
+  has long-tail phrasing the set doesn't cover. Eval numbers are directional. (The
+  adversarial bucket now has 13 real-transaction rows, so its F1 is no longer the ~3-row
+  noise it was at n=62, but it's still a small sample.)
 - **THB-only**; no income/expense sign, no installments, no per-item splitting of a total.
 - **Cost/latency depend on OpenRouter routing** — provider failover can change both between
   runs; the availability column captures this but a single eval run is a snapshot.
@@ -379,17 +376,20 @@ to match product tolerance; otherwise it's the cost lever you reach for under lo
 
 ## 13. Time spent
 
-~3.5 hours: ~30m dataset, ~45m NER core + contract shell, ~60m eval harness (scoring rigor
-was the bulk), ~45m README, ~30m live eval + debugging the dead gemini-2.0 model ID and
-writing up the recommendation. Within the 2–4h guideline. The walkthrough video is left to do.
+~4.5 hours: ~45m dataset (incl. expansion to 100), ~45m NER core + contract shell, ~70m
+eval harness (scoring rigor was the bulk), ~50m README, ~40m live eval — including
+debugging two dead/quota-exhausted model IDs (gemini-2.0 → 404, gemini-2.5 → 402) and
+swapping in llama-3.3-70b — plus the tiered cost-optimization bonus. Slightly over the
+2–4h guideline because of the model-availability churn. Walkthrough video left to do.
 
 ---
 
 ### Honesty notes
 
 - No model numbers are invented — every figure comes from the committed
-  `reports/eval_report.md` (live run, 2026-06-01). Re-run `uv run python src/eval.py` to
-  reproduce. The contract layer is separately verified offline (`--selftest`, 18/18).
+  `reports/eval_report.md` (single clean 100-row run, both models completing every row).
+  Re-run `uv run python src/eval.py` to reproduce. The contract layer is separately
+  verified offline (`--selftest`, 18/18).
 - OpenRouter's `usage.cost` field and `/generation` cost semantics are recalled, not
   re-confirmed against docs (the docs pages 404'd during the build); the harness therefore
   falls back to live `/models` pricing and reports cost coverage so a missing field is

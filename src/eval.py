@@ -18,7 +18,7 @@ from src.ner import extract, enforce_contract, parse_model_output  # noqa: E402
 
 DATASET = ROOT / "data" / "dataset.jsonl"
 DEFAULT_MODELS = os.environ.get(
-    "NER_MODELS", "google/gemini-2.5-flash-lite,openai/gpt-4o-mini"
+    "NER_MODELS", "openai/gpt-4o-mini,meta-llama/llama-3.3-70b-instruct"
 ).split(",")
 
 AVAILABILITY = re.compile(r"^(timeout|http_5\d\d|http_429|http_402|request_error)")
@@ -451,6 +451,8 @@ def main() -> int:
                     help="compare pure LLM vs regex-fast-path+LLM hybrid (cost bonus)")
     ap.add_argument("--tiered-model", default="openai/gpt-4o-mini",
                     help="the LLM the tiered comparison falls back to")
+    ap.add_argument("--delay", type=float, default=0.0,
+                    help="seconds between calls; throttle to avoid rate-limits")
     args = ap.parse_args()
 
     if args.selftest:
@@ -474,7 +476,7 @@ def main() -> int:
     results = []
     for m in models:
         print(f"  -> {m}")
-        results.append(run_model(m, rows))
+        results.append(run_model(m, rows, delay=args.delay))
 
     # markdown report -> file (readable, committable); aligned summary -> terminal
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
