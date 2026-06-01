@@ -1,10 +1,4 @@
-"""Thai text -> transaction NER.
-
-Core guarantee: extract() ALWAYS returns {"transactions": [ {amount, detail}, ... ]}.
-It never raises on bad input, never invents amounts, never leaks prompt injection.
-Everything the model returns is treated as untrusted and re-validated against the
-contract before we hand it back.
-
+"""
 Run directly to extract from one message:
 
     uv run python src/ner.py "ข้าวมันไก่ 50 น้ำเปล่า 7 แล้วก็ช้อปปิ้ง 500"
@@ -30,7 +24,7 @@ except Exception:  # dotenv is optional; env vars may be set another way
     pass
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_MODEL = os.environ.get("NER_DEFAULT_MODEL", "google/gemini-2.0-flash-001")
+DEFAULT_MODEL = os.environ.get("NER_DEFAULT_MODEL", "google/gemini-2.5-flash-lite")
 
 # Guards against runaway cost / huge-input abuse. We truncate rather than reject so the
 # system still "supports any input without breaking".

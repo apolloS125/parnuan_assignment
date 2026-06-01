@@ -9,3 +9,6 @@ __pycache__/
 
 # uv (uv.lock IS committed for reproducibility)
 .uv/
+
+# claude code local artifacts
+.claude/
