@@ -150,7 +150,9 @@ def pct(xs: list[float], q: float) -> float:
 # --------------------------------------------------------------------------- #
 # Run one model over the dataset.
 # --------------------------------------------------------------------------- #
-def run_model(model: str, rows: list[dict], retries: int = 2) -> dict:
+def run_model(model: str, rows: list[dict], retries: int = 2, extract_fn=extract) -> dict:
+    """extract_fn defaults to the pure-LLM extract(); pass extract_tiered for the
+    regex-fast-path-then-LLM hybrid (cost-optimization bonus). Same scoring either way."""
     per_bucket = collections.defaultdict(
         lambda: {"txn": [0, 0, 0], "amt": [0, 0, 0], "det": [0, 0, 0],
                  "exact": 0, "count_ok": 0, "n": 0}
@@ -163,6 +165,7 @@ def run_model(model: str, rows: list[dict], retries: int = 2) -> dict:
     api_calls = 0
     short_circuits = 0
     avail_failures = 0
+    fast_paths = 0                       # rows answered by regex (tiered mode), no LLM
     taxonomy = collections.Counter()
     examples: dict[str, list] = collections.defaultdict(list)
     injection_leaks = []
@@ -171,16 +174,20 @@ def run_model(model: str, rows: list[dict], retries: int = 2) -> dict:
         text, gold, bucket = row["text"], row["transactions"], row["bucket"]
 
         # call with retry on transient errors
-        result, meta = extract(text, model=model)
+        result, meta = extract_fn(text, model=model)
         attempt = 0
         while meta.get("error") and TRANSIENT.match(meta["error"]) and attempt < retries:
             time.sleep(1.5 * (attempt + 1))
-            result, meta = extract(text, model=model)
+            result, meta = extract_fn(text, model=model)
             attempt += 1
         pred = result["transactions"]  # extract() guarantees this list exists
-
         err = meta.get("error")
-        if err in ("empty_input", "non_string_input"):
+        if meta.get("path") == "fast_path":
+            # answered by regex, no LLM call: $0 cost (counts toward $/1k), no latency.
+            fast_paths += 1
+            costs.append(0.0)
+            cost_known += 1
+        elif err in ("empty_input", "non_string_input"):
             # pre-guard short-circuit: no API call, ~0 cost/latency. Still scored
             # (these rows expect [], and returning [] is correct).
             short_circuits += 1
@@ -239,6 +246,8 @@ def run_model(model: str, rows: list[dict], retries: int = 2) -> dict:
         "api_calls": api_calls,
         "short_circuits": short_circuits,
         "avail_failures": avail_failures,
+        "fast_paths": fast_paths,
+        "n_rows": len(rows),
         "taxonomy": dict(taxonomy),
         "examples": dict(examples),
         "injection_leaks": injection_leaks,
@@ -365,6 +374,10 @@ def main() -> int:
     ap.add_argument("--out", default=str(ROOT / "reports" / "eval_report.md"))
     ap.add_argument("--selftest", action="store_true",
                     help="offline graceful-degradation checks, no API key")
+    ap.add_argument("--tiered", action="store_true",
+                    help="compare pure LLM vs regex-fast-path+LLM hybrid (cost bonus)")
+    ap.add_argument("--tiered-model", default="openai/gpt-4o-mini",
+                    help="the LLM the tiered comparison falls back to")
     args = ap.parse_args()
 
     if args.selftest:
@@ -379,8 +392,11 @@ def main() -> int:
     rows = [json.loads(l) for l in DATASET.open(encoding="utf-8") if l.strip()]
     if args.limit:
         rows = rows[: args.limit]
-    models = [m.strip() for m in args.models.split(",") if m.strip()]
 
+    if args.tiered:
+        return run_tiered_comparison(rows, args.tiered_model, args.out)
+
+    models = [m.strip() for m in args.models.split(",") if m.strip()]
     print(f"Evaluating {len(models)} model(s) on {len(rows)} messages...\n")
     results = []
     for m in models:
@@ -392,6 +408,65 @@ def main() -> int:
     Path(args.out).write_text(report, encoding="utf-8")
     print("\n" + report)
     print(f"\nReport written to {args.out}")
+    return 0
+
+
+def run_tiered_comparison(rows: list[dict], model: str, out: str) -> int:
+    """Bonus: pure LLM vs regex-fast-path+LLM hybrid on the same rows + model.
+    Reports F1 delta, % fast-pathed (cost win), cost delta, and the kill metric:
+    fast-path-induced regressions (hallucinations / wrong amounts the pure LLM avoided)."""
+    from src.tiered import extract_tiered
+
+    print(f"Tiered comparison on {len(rows)} messages (fallback model: {model})...\n")
+    print("  -> pure LLM")
+    pure = run_model(model, rows, extract_fn=extract)
+    print("  -> tiered (regex + LLM)")
+    tiered = run_model(model, rows, extract_fn=extract_tiered)
+
+    def f1(r):
+        return prf(*r["overall"]["txn"])[2]
+
+    def af1(r):
+        return prf(*r["overall"]["amt"])[2]
+
+    def df1(r):
+        return prf(*r["overall"]["det"])[2]
+
+    def em(r):
+        return r["overall"]["exact"] / r["overall"]["n"]
+
+    fp = tiered["fast_paths"]
+    n = tiered["n_rows"]
+    # regression = a severe failure type the tiered run has that pure doesn't (by count)
+    severe = ("hallucinated_txn", "wrong_amount", "split_or_extra_txn")
+    reg = {k: tiered["taxonomy"].get(k, 0) - pure["taxonomy"].get(k, 0) for k in severe}
+    reg = {k: v for k, v in reg.items() if v > 0}
+
+    lines = [
+        "# Tiered Cost-Optimization Report\n",
+        f"Regex fast-path → `{model}` fallback, vs pure `{model}`, on {n} messages.\n",
+        "| Metric | Pure LLM | Tiered | Δ |",
+        "|---|---|---|---|",
+        f"| Txn F1 | {f1(pure):.3f} | {f1(tiered):.3f} | {f1(tiered)-f1(pure):+.3f} |",
+        f"| Amount F1 | {af1(pure):.3f} | {af1(tiered):.3f} | {af1(tiered)-af1(pure):+.3f} |",
+        f"| Detail F1 | {df1(pure):.3f} | {df1(tiered):.3f} | {df1(tiered)-df1(pure):+.3f} |",
+        f"| Exact-match | {em(pure):.1%} | {em(tiered):.1%} | {(em(tiered)-em(pure))*100:+.1f} pts |",
+        f"| LLM calls | {pure['api_calls']} | {tiered['api_calls']} | {tiered['api_calls']-pure['api_calls']} |",
+        f"| $/1k msgs | ${pure['cost_per_1k']:.3f} | ${tiered['cost_per_1k']:.3f} | "
+        f"{(tiered['cost_per_1k']-pure['cost_per_1k'])/pure['cost_per_1k']*100:+.0f}% |",
+        "",
+        f"- **Fast-pathed (no LLM): {fp}/{n} = {fp/n:.0%}** — the cost win.",
+        f"- **Fast-path-induced regressions (kill metric): "
+        f"{'NONE ✅' if not reg else str(reg) + ' ⚠️'}**",
+        f"- Pure injection leaks: {len(pure['injection_leaks'])} | "
+        f"Tiered injection leaks: {len(tiered['injection_leaks'])}",
+    ]
+    report = "\n".join(lines)
+    tpath = str(Path(out).parent / "tiered_report.md")
+    Path(tpath).parent.mkdir(parents=True, exist_ok=True)
+    Path(tpath).write_text(report, encoding="utf-8")
+    print("\n" + report)
+    print(f"\nReport written to {tpath}")
     return 0
 
 
